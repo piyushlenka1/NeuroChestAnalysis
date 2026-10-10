@@ -1,0 +1,482 @@
+# ============================================================
+# CELL 3 (REVISED) — PROBABILITY DISTRIBUTION DIAGNOSTIC
+# Run this FIRST before setting any thresholds
+# ============================================================
+
+fig, axes = plt.subplots(3, 5, figsize=(20, 12))
+axes = axes.flatten()
+
+for i, label in enumerate(label_cols):
+    pos_mask = val_targets[:, i] == 1
+    neg_mask = val_targets[:, i] == 0
+
+    pos_probs = val_probs[:, i][pos_mask]
+    neg_probs = val_probs[:, i][neg_mask]
+
+    axes[i].hist(neg_probs, bins=40, alpha=0.6, color='steelblue', label=f'Neg (n={neg_mask.sum()})', density=True)
+    axes[i].hist(pos_probs, bins=40, alpha=0.6, color='red',       label=f'Pos (n={pos_mask.sum()})', density=True)
+    axes[i].set_title(label.replace("_", " "), fontsize=9)
+    axes[i].set_xlabel("P(sigmoid)", fontsize=7)
+    axes[i].legend(fontsize=6)
+
+plt.suptitle("Sigmoid Output Distribution: Positive vs Negative per Class", fontsize=13)
+plt.tight_layout()
+plt.show()
+
+
+---
+# ============================================================
+# CELL 4 — TIERS + THRESHOLDS + GATE FUNCTION
+# ============================================================
+
+# --- Define tiers FIRST (used as default args below) ---
+TIER1_RELIABLE   = ["Atelectasis", "Cardiomegaly", "Effusion", "Mass",
+                     "Pneumothorax", "Edema", "Emphysema", "Hernia"]
+TIER2_MARGINAL   = ["Consolidation", "Fibrosis", "Pleural_Thickening"]
+TIER3_WEAK       = ["Infiltration", "Nodule", "Pneumonia"]
+DETECTION_ELIGIBLE = TIER1_RELIABLE + TIER2_MARGINAL
+
+def get_detection_labels(probs_single, label_cols, final_thresholds,
+                         detection_eligible=DETECTION_ELIGIBLE):
+    positives = []
+    for i, label in enumerate(label_cols):
+        if label == "No Finding":
+            continue
+        if label not in detection_eligible:
+            continue
+        if probs_single[i] >= final_thresholds[label]:
+            positives.append((label, float(probs_single[i])))
+    positives.sort(key=lambda x: -x[1])
+    return positives
+
+# --- Youden threshold search ---
+MIN_PRECISION_FLOOR = 0.10
+
+def find_thresholds_youden(probs, targets, label_cols, min_precision=0.10):
+    thresholds  = {}
+    diagnostics = {}
+    for i, label in enumerate(label_cols):
+        y_true = targets[:, i]
+        y_prob = probs[:, i]
+        if len(np.unique(y_true)) < 2 or y_true.sum() < 5:
+            thresholds[label]  = 0.5
+            diagnostics[label] = {"method": "fallback", "note": "too few positives"}
+            continue
+        fpr, tpr, roc_thresh = roc_curve(y_true, y_prob)
+        best_j_idx    = np.argmax(tpr - fpr)
+        youden_thresh = float(roc_thresh[best_j_idx])
+        prec_j = precision_score(y_true, (y_prob >= youden_thresh).astype(int), zero_division=0)
+        if prec_j >= min_precision:
+            thresholds[label]  = youden_thresh
+            diagnostics[label] = {"method": "youden_j",  "prec": prec_j,
+                                   "tpr": tpr[best_j_idx], "fpr": fpr[best_j_idx]}
+        else:
+            precision_arr, recall_arr, pr_thresh = precision_recall_curve(y_true, y_prob)
+            p, r = precision_arr[:-1], recall_arr[:-1]
+            valid = p >= min_precision
+            if valid.any():
+                best_idx = np.where(valid, r, -1).argmax()
+                thresholds[label]  = float(pr_thresh[best_idx])
+                diagnostics[label] = {"method": "precision_floor",
+                                       "prec": p[best_idx], "rec": r[best_idx]}
+            else:
+                with np.errstate(invalid='ignore'):
+                    f1_vals = np.where((p + r) > 0, 2 * p * r / (p + r), 0.0)
+                thresholds[label]  = float(pr_thresh[np.argmax(f1_vals)])
+                diagnostics[label] = {"method": "f1_fallback", "note": "prec floor unreachable"}
+    return thresholds, diagnostics
+
+final_thresholds, thresh_diagnostics = find_thresholds_youden(
+    val_probs, val_targets, label_cols, min_precision=MIN_PRECISION_FLOOR
+)
+
+# --- Manual overrides (Tier3 + No Finding) ---
+manual_overrides = {
+    "Infiltration": 0.75,
+    "Nodule":       0.80,
+    "Pneumonia":    0.87,
+    "No Finding":   0.50,
+}
+final_thresholds = {**final_thresholds, **manual_overrides}
+
+# --- Print summary ---
+print(f"\n{'Label':<25} {'Thresh':>8}  {'Method':<20} {'Info'}")
+print("-" * 72)
+for label in label_cols:
+    t = final_thresholds[label]
+    d = thresh_diagnostics[label]
+    info = f"prec={d['prec']:.2f}" if "prec" in d else d.get("note", "")
+    tier = "(T3-override)" if label in TIER3_WEAK else ""
+    print(f"{label:<25} {t:>8.4f}  {d['method']:<20} {info}  {tier}")
+
+print(f"\n{'Label':<25} {'Thresh':>8} {'Prec':>7} {'Rec':>7} {'F1':>7} {'Eligible':>10}")
+print("-" * 70)
+for i, label in enumerate(label_cols):
+    t      = final_thresholds[label]
+    y_pred = (val_probs[:, i] >= t).astype(int)
+    y_true = val_targets[:, i].astype(int)
+    p  = precision_score(y_true, y_pred, zero_division=0)
+    r  = recall_score(y_true, y_pred, zero_division=0)
+    f  = f1_score(y_true, y_pred, zero_division=0)
+    el = "YES" if label in DETECTION_ELIGIBLE else ("T3-gradcam" if label in TIER3_WEAK else "—")
+    print(f"{label:<25} {t:>8.4f} {p:>7.3f} {r:>7.3f} {f:>7.3f} {el:>10}")
+
+nf_idx = label_cols.index("No Finding")
+no_finding_rows    = val_targets[:, nf_idx] == 1
+disease_thresh_arr = np.array([final_thresholds[l] for l in label_cols[:14]])
+any_disease_pred   = (val_probs[:, :14] >= disease_thresh_arr).any(axis=1)
+print(f"\nNo Finding falsely flagged with disease: {any_disease_pred[no_finding_rows].mean()*100:.1f}%")
+print(f"\nDETECTION_ELIGIBLE ({len(DETECTION_ELIGIBLE)} classes): {DETECTION_ELIGIBLE}")
+---
+print("\n--- Test Set ---")
+test_probs, test_targets = get_probs_targets(model, test_loader, device)
+ 
+# Per-class AUC on test
+test_auc_per_class = {}
+for i, label in enumerate(label_cols):
+    if len(np.unique(test_targets[:, i])) > 1:
+        test_auc_per_class[label] = roc_auc_score(test_targets[:, i], test_probs[:, i])
+    else:
+        test_auc_per_class[label] = np.nan
+ 
+valid_test_aucs = [v for v in test_auc_per_class.values() if not np.isnan(v)]
+mean_test_auc = np.mean(valid_test_aucs)
+ 
+# CheXNet benchmarks per class (Wang et al. / Rajpurkar et al.)
+chexnet_benchmarks = {
+    "Atelectasis": 0.8094, "Cardiomegaly": 0.9248, "Effusion": 0.8638,
+    "Infiltration": 0.7345, "Mass": 0.8676, "Nodule": 0.7802,
+    "Pneumonia": 0.7680, "Pneumothorax": 0.8887, "Consolidation": 0.7901,
+    "Edema": 0.8878, "Emphysema": 0.9371, "Fibrosis": 0.8047,
+    "Pleural_Thickening": 0.8062, "Hernia": 0.9164, "No Finding": np.nan,
+}
+ 
+print(f"\nMean Test AUC : {mean_test_auc:.4f}   (CheXNet mean: ~0.84)")
+print(f"\n{'Label':<25} {'Test AUC':>10} {'CheXNet':>10} {'Delta':>8}")
+print("-" * 58)
+for label in label_cols:
+    t_auc  = test_auc_per_class.get(label, np.nan)
+    chex   = chexnet_benchmarks.get(label, np.nan)
+    delta  = (t_auc - chex) if not (np.isnan(t_auc) or np.isnan(chex)) else np.nan
+    delta_str = f"{delta:+.4f}" if not np.isnan(delta) else "    —"
+    print(f"{label:<25} {t_auc:>10.4f} {chex:>10.4f} {delta_str:>8}")
+ 
+# Per-class classification metrics at final thresholds
+print(f"\n--- Per-class test metrics at final thresholds ---")
+print(f"{'Label':<25} {'Thresh':>8} {'Prec':>7} {'Rec':>7} {'F1':>7} {'TP':>6} {'FP':>6} {'FN':>6}")
+print("-" * 80)
+for i, label in enumerate(label_cols):
+    t      = final_thresholds[label]
+    y_pred = (test_probs[:, i] >= t).astype(int)
+    y_true = test_targets[:, i].astype(int)
+    tn, fp, fn, tp = confusion_matrix(y_true, y_pred, labels=[0, 1]).ravel()
+    p = precision_score(y_true, y_pred, zero_division=0)
+    r = recall_score(y_true, y_pred, zero_division=0)
+    f = f1_score(y_true, y_pred, zero_division=0)
+    print(f"{label:<25} {t:>8.4f} {p:>7.3f} {r:>7.3f} {f:>7.3f} {tp:>6} {fp:>6} {fn:>6}")
+ 
+# No Finding false alarm rate on test
+no_finding_rows_test = test_targets[:, nf_idx] == 1
+disease_thresh_arr   = np.array([final_thresholds[l] for l in label_cols[:14]])
+any_disease_pred_test = (test_probs[:, :14] >= disease_thresh_arr).any(axis=1)
+false_alarm_test = any_disease_pred_test[no_finding_rows_test].mean()
+print(f"\nTest — No Finding images falsely flagged with disease: {false_alarm_test*100:.1f}%")
+ 
+# Positive prediction rate per class
+print(f"\n--- Positive prediction rate on test set ---")
+print(f"{'Label':<25} {'Pred Pos %':>12} {'GT Pos %':>12}")
+print("-" * 52)
+for i, label in enumerate(label_cols):
+    t       = final_thresholds[label]
+    pred_p  = (test_probs[:, i] >= t).mean() * 100
+    gt_p    = test_targets[:, i].mean() * 100
+    print(f"{label:<25} {pred_p:>11.2f}% {gt_p:>11.2f}%")
+ 
+# ROC curves subplot grid
+n_labels = len(label_cols)
+ncols = 5
+nrows = math.ceil(n_labels / ncols)
+fig, axes = plt.subplots(nrows, ncols, figsize=(4 * ncols, 3 * nrows))
+axes = axes.flatten()
+for i, label in enumerate(label_cols):
+    if len(np.unique(test_targets[:, i])) < 2:
+        axes[i].set_visible(False)
+        continue
+    fpr, tpr, _ = roc_curve(test_targets[:, i], test_probs[:, i])
+    auc = test_auc_per_class[label]
+    axes[i].plot(fpr, tpr, color="#e74c3c", lw=1.5)
+    axes[i].plot([0, 1], [0, 1], "k--", lw=0.8)
+    axes[i].set_title(f"{label}\nAUC={auc:.3f}", fontsize=9)
+    axes[i].set_xlabel("FPR", fontsize=8)
+    axes[i].set_ylabel("TPR", fontsize=8)
+for j in range(i + 1, len(axes)):
+    axes[j].set_visible(False)
+plt.suptitle("ROC Curves — Test Set", fontsize=13, y=1.01)
+plt.tight_layout()
+plt.show()
+ 
+---
+# Per-condition CAM thresholds (applied to normalised [0,1] heatmap)
+# Morphology-driven — do not confuse with probability thresholds
+CAM_THRESHOLDS = {
+    # Diffuse: spreads across lobe
+    "Pneumonia":          0.40,
+    "Edema":              0.40,
+    "Infiltration":       0.42,
+    "Consolidation":      0.42,
+    # Focal: tight region
+    "Nodule":             0.60,
+    "Mass":               0.58,
+    "Pneumothorax":       0.62,
+    "Emphysema":          0.52,
+    # Large structure
+    "Cardiomegaly":       0.33,
+    # Mixed
+    "Atelectasis":        0.47,
+    "Effusion":           0.43,
+    "Fibrosis":           0.50,
+    "Pleural_Thickening": 0.50,
+    "Hernia":             0.45,
+    "No Finding":         0.50,   # never used — No Finding never fires GradCAM
+}
+ 
+# Color per condition (BGR for cv2)
+CONDITION_COLORS_BGR = {
+    "Atelectasis":        (80,  200, 255),   # amber
+    "Cardiomegaly":       (80,  255, 160),   # green
+    "Effusion":           (255, 160, 80),    # blue
+    "Infiltration":       (255, 255, 100),   # yellow
+    "Mass":               (255, 80,  255),   # magenta
+    "Nodule":             (100, 255, 255),   # cyan
+    "Pneumonia":          (80,  80,  255),   # red
+    "Pneumothorax":       (180, 255, 80),    # lime
+    "Consolidation":      (255, 180, 80),    # light blue
+    "Edema":              (200, 80,  200),   # purple
+    "Emphysema":          (80,  255, 230),   # teal
+    "Fibrosis":           (80,  130, 255),   # coral
+    "Pleural_Thickening": (255, 200, 130),   # sky
+    "Hernia":             (130, 80,  255),   # pink
+    "No Finding":         (200, 200, 200),
+}
+ 
+ 
+def overlay_heatmap(bgr_img, cam, alpha=0.45):
+    """
+    Returns: heatmap overlay (BGR), and the raw cam_r channel (for contour extraction).
+    cam: [0,1] float array, same H×W as bgr_img
+    """
+    heat_uint8 = (cam * 255).astype(np.uint8)
+    heatmap    = cv2.applyColorMap(heat_uint8, cv2.COLORMAP_JET)  # BGR
+    overlay    = cv2.addWeighted(bgr_img, 1 - alpha, heatmap, alpha, 0)
+    # Return the red channel of JET heatmap for contour thresholding
+    cam_r = heatmap[:, :, 2]  # red channel encodes high-activation region in JET
+    return overlay, cam_r
+ 
+ 
+def draw_contours_and_bbox(bgr_img, cam_r, label, cam_threshold):
+    """
+    Draws filled contours + bounding box on a copy of bgr_img.
+    cam_threshold: fraction of 255 (e.g. 0.40 → thresh=102)
+    """
+    result   = bgr_img.copy()
+    color    = CONDITION_COLORS_BGR.get(label, (255, 255, 255))
+    thresh_v = int(cam_threshold * 255)
+ 
+    _, binary = cv2.threshold(cam_r, thresh_v, 255, cv2.THRESH_BINARY)
+    # Morphological cleanup
+    kernel  = np.ones((5, 5), np.uint8)
+    binary  = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel)
+    binary  = cv2.morphologyEx(binary, cv2.MORPH_OPEN,  kernel)
+ 
+    contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+ 
+    # Filter noise contours (min area = 0.5% of image area)
+    h, w    = bgr_img.shape[:2]
+    min_area = 0.005 * h * w
+    contours = [c for c in contours if cv2.contourArea(c) > min_area]
+ 
+    cv2.drawContours(result, contours, -1, color, 2)
+ 
+    for c in contours:
+        x, y, cw, ch = cv2.boundingRect(c)
+        cv2.rectangle(result, (x, y), (x + cw, y + ch), color, 2)
+        cv2.putText(result, label.replace("_", " "),
+                    (x, max(y - 6, 12)),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, color, 1, cv2.LINE_AA)
+ 
+    return result, contours
+ 
+ 
+def denorm_to_bgr(img_tensor):
+    """Convert normalised CHW tensor to uint8 BGR for cv2."""
+    mean = np.array([0.485, 0.456, 0.406])
+    std  = np.array([0.229, 0.224, 0.225])
+    img  = img_tensor.permute(1, 2, 0).cpu().numpy()
+    img  = img * std + mean
+    img  = np.clip(img, 0, 1)
+    img_rgb  = (img * 255).astype(np.uint8)
+    img_bgr  = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2BGR)
+    return img_bgr
+ 
+ 
+---
+ 
+gradcam = GradCAM(model)
+ 
+# Pick one val sample with multiple diseases for sanity check
+sample_img, sample_target = val_dataset[1]
+input_tensor = sample_img.unsqueeze(0).to(device)
+bgr_img      = denorm_to_bgr(sample_img)
+ 
+active_labels = [label_cols[i] for i, v in enumerate(sample_target.numpy()) if v > 0.5]
+print("Ground truth labels:", active_labels)
+ 
+# Also check model predictions
+with torch.no_grad():
+    logits = model(input_tensor)
+    probs  = torch.sigmoid(logits)[0].cpu().numpy()
+ 
+pred_labels = [label_cols[i] for i, p in enumerate(probs)
+               if p >= final_thresholds[label_cols[i]]]
+print("Predicted labels   :", pred_labels)
+ 
+# Visualise GradCAM for each predicted positive
+display_labels = [l for l in pred_labels if l != "No Finding"]
+
+if display_labels:
+    ncols = min(len(display_labels) + 1, 5)
+    fig, axes = plt.subplots(1, ncols, figsize=(4 * ncols, 4))
+    if ncols == 1:
+        axes = [axes]
+
+    axes[0].imshow(cv2.cvtColor(bgr_img, cv2.COLOR_BGR2RGB))
+    axes[0].set_title("Original", fontsize=10)
+    axes[0].axis("off")
+
+    for j, label in enumerate(display_labels[:ncols - 1]):
+        class_idx = label_cols.index(label)
+        cam_up = gradcam.generate_upsampled(input_tensor, class_idx)
+        overlay, cam_r = overlay_heatmap(bgr_img.copy(), cam_up)
+        result, _ = draw_contours_and_bbox(overlay, cam_r, label, CAM_THRESHOLDS[label])
+        p = probs[class_idx]
+        axes[j + 1].imshow(cv2.cvtColor(result, cv2.COLOR_BGR2RGB))
+        axes[j + 1].set_title(f"{label.replace('_',' ')}\np={p:.3f}", fontsize=9)
+        axes[j + 1].axis("off")
+
+    plt.suptitle("Sanity Check — Single Image GradCAM", fontsize=12)
+    plt.tight_layout()
+    plt.show()
+else:
+    print("No predicted positives on this sample — try a different index.")
+ 
+ 
+---
+LOCALIZATION_N    = 1000
+SAVE_LOCALIZATION = True          # flip to False to skip disk writes
+OUTPUT_DIR        = "gradcam_localizations"
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+ 
+# Sample 1000 from val set — prefer images with at least one predicted positive
+np.random.seed(42)
+sample_indices = np.random.choice(len(val_dataset), size=min(LOCALIZATION_N, len(val_dataset)),
+                                   replace=False)
+ 
+localization_stats = {label: {"total_pred_pos": 0, "total_gt_pos": 0,
+                               "has_contour": 0, "no_contour": 0}
+                      for label in label_cols}
+ 
+print(f"\nRunning GradCAM localization on {len(sample_indices)} val images...")
+ 
+for sample_num, idx in enumerate(tqdm(sample_indices)):
+    img_tensor, target = val_dataset[idx]
+    input_t  = img_tensor.unsqueeze(0).to(device)
+    bgr_orig = denorm_to_bgr(img_tensor)
+ 
+    with torch.no_grad():
+        logits = model(input_t)
+        probs_i = torch.sigmoid(logits)[0].cpu().numpy()
+ 
+    active_pred = [label_cols[i] for i, p in enumerate(probs_i)
+                   if p >= final_thresholds[label_cols[i]] and label_cols[i] != "No Finding"]
+ 
+    # Skip pure No Finding predictions for localization
+    if not active_pred:
+        continue
+ 
+    # Build 4-panel figure: original | heatmap blend | contours+bbox | gt labels
+    all_cams    = {}
+    overlay_acc = bgr_orig.copy()   # accumulate all conditions on one overlay
+ 
+    for label in active_pred:
+        class_idx   = label_cols.index(label)
+        cam_up      = gradcam.generate_upsampled(input_t, class_idx)
+        all_cams[label] = cam_up
+ 
+        # Update stats
+        gt_pos = int(target[class_idx].item() > 0.5)
+        localization_stats[label]["total_pred_pos"] += 1
+        localization_stats[label]["total_gt_pos"]   += gt_pos
+ 
+    # Build combined overlay (blend all active CAMs)
+    if all_cams:
+        combined_cam = np.max(np.stack(list(all_cams.values())), axis=0)
+        heatmap_overlay, _ = overlay_heatmap(bgr_orig.copy(), combined_cam, alpha=0.5)
+ 
+        # Draw per-condition contours
+        contour_img = bgr_orig.copy()
+        for label, cam_up in all_cams.items():
+            _, cam_r_i = overlay_heatmap(bgr_orig.copy(), cam_up, alpha=0.0)
+            contour_img, cnts = draw_contours_and_bbox(contour_img, cam_r_i,
+                                                        label, CAM_THRESHOLDS[label])
+            if cnts:
+                localization_stats[label]["has_contour"]  += 1
+            else:
+                localization_stats[label]["no_contour"]   += 1
+ 
+        if SAVE_LOCALIZATION:
+            # Save 3-panel: original | heatmap | contours
+            panel = np.hstack([bgr_orig, heatmap_overlay, contour_img])
+            gt_names   = [label_cols[i].replace("_", " ")
+                          for i, v in enumerate(target.numpy()) if v > 0.5]
+            pred_names = [l.replace("_", " ") for l in active_pred]
+            h, w = panel.shape[:2]
+            bar  = np.zeros((40, w, 3), dtype=np.uint8)
+            text = f"GT: {', '.join(gt_names) or 'None'}   |   Pred: {', '.join(pred_names)}"
+            cv2.putText(bar, text[:100], (6, 26),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, (220, 220, 220), 1)
+            full = np.vstack([panel, bar])
+            cv2.imwrite(os.path.join(OUTPUT_DIR, f"loc_{sample_num:04d}.jpg"), full,
+                        [int(cv2.IMWRITE_JPEG_QUALITY), 85])
+ 
+---
+# Shows per-class: how often predicted positives actually have
+# a visible contour (i.e. model attention region is non-trivial)
+# ============================================================
+ 
+print(f"\n--- Localization Stats over {LOCALIZATION_N} val images ---")
+print(f"{'Label':<25} {'PredPos':>8} {'GTPos':>7} {'WithContour':>13} {'ContourRate':>13}")
+print("-" * 72)
+for label in label_cols:
+    s = localization_stats[label]
+    pp  = s["total_pred_pos"]
+    gtp = s["total_gt_pos"]
+    hc  = s["has_contour"]
+    rate = hc / pp * 100 if pp > 0 else 0.0
+    print(f"{label:<25} {pp:>8} {gtp:>7} {hc:>13} {rate:>12.1f}%")
+ 
+# Save final thresholds dict for downstream detection model
+import json
+threshold_export = {
+    "probability_thresholds": final_thresholds,
+    "cam_thresholds":         CAM_THRESHOLDS,
+    "mean_val_auc":           float(mean_val_auc),
+    "mean_test_auc":          float(mean_test_auc),
+    "per_class_test_auc":     {k: float(v) if not np.isnan(v) else None
+                               for k, v in test_auc_per_class.items()},
+}
+with open("thresholds_and_metrics.json", "w") as f:
+    json.dump(threshold_export, f, indent=2)
+ 
+print("\nSaved thresholds_and_metrics.json — pass probability_thresholds to detection model.")
+print("Detection model uses label_cols[:14] positive predictions as its input label set.")
+ 
